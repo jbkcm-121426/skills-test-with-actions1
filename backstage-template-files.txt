@@ -1,0 +1,534 @@
+# template.yaml - Main Backstage Template Definition
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: azure-vm-template
+  title: Azure Virtual Machine
+  description: Deploy a simple virtual machine on Azure with networking and security configurations
+  tags:
+    - azure
+    - vm
+    - infrastructure
+    - bicep
+spec:
+  owner: platform-team
+  type: infrastructure
+  
+  parameters:
+    - title: Basic Information
+      required:
+        - name
+        - description
+        - owner
+      properties:
+        name:
+          title: Service Name
+          type: string
+          pattern: '^([a-z0-9]+-)*[a-z0-9]+$'
+          description: Unique name for your VM service (lowercase, hyphens allowed)
+        description:
+          title: Description
+          type: string
+          description: What does this VM do?
+        owner:
+          title: Owner
+          type: string
+          description: Team or individual owning this resource
+          ui:field: OwnerPicker
+          ui:options:
+            allowedKinds:
+              - Group
+              - User
+
+    - title: Azure Configuration
+      required:
+        - location
+        - vmSize
+        - osType
+      properties:
+        location:
+          title: Azure Region
+          type: string
+          description: Azure region for deployment
+          default: eastus
+          enum:
+            - eastus
+            - westus2
+            - centralus
+            - northeurope
+            - westeurope
+            - southeastasia
+        vmSize:
+          title: VM Size
+          type: string
+          description: Azure VM size
+          default: Standard_B2s
+          enum:
+            - Standard_B1s
+            - Standard_B2s
+            - Standard_B4ms
+            - Standard_D2s_v3
+            - Standard_D4s_v3
+        osType:
+          title: Operating System
+          type: string
+          description: Choose the operating system
+          default: ubuntu
+          enum:
+            - ubuntu
+            - windows
+          enumNames:
+            - Ubuntu 20.04 LTS
+            - Windows Server 2022
+
+    - title: Network Configuration
+      required:
+        - allowSshRdp
+      properties:
+        allowSshRdp:
+          title: Allow SSH/RDP Access
+          type: boolean
+          description: Allow inbound SSH (Linux) or RDP (Windows) access
+          default: false
+        allowedIpRanges:
+          title: Allowed IP Ranges
+          type: array
+          description: IP ranges allowed for SSH/RDP (leave empty for no access)
+          items:
+            type: string
+          default: []
+
+    - title: Repository Information
+      required:
+        - repoUrl
+      properties:
+        repoUrl:
+          title: Repository Location
+          type: string
+          ui:field: RepoUrlPicker
+          ui:options:
+            allowedHosts:
+              - github.com
+
+  steps:
+    - id: fetch-base
+      name: Fetch Base
+      action: fetch:template
+      input:
+        url: ./skeleton
+        values:
+          name: ${{ parameters.name }}
+          description: ${{ parameters.description }}
+          owner: ${{ parameters.owner }}
+          location: ${{ parameters.location }}
+          vmSize: ${{ parameters.vmSize }}
+          osType: ${{ parameters.osType }}
+          allowSshRdp: ${{ parameters.allowSshRdp }}
+          allowedIpRanges: ${{ parameters.allowedIpRanges }}
+          repoUrl: ${{ parameters.repoUrl }}
+
+    - id: publish
+      name: Publish
+      action: publish:github
+      input:
+        allowedHosts: ['github.com']
+        description: Azure VM deployment for ${{ parameters.name }}
+        repoUrl: ${{ parameters.repoUrl }}
+        defaultBranch: main
+        gitCommitMessage: 'Initial commit for ${{ parameters.name }} VM'
+        gitAuthorName: Backstage
+        gitAuthorEmail: noreply@backstage.io
+
+    - id: register
+      name: Register
+      action: catalog:register
+      input:
+        repoContentsUrl: ${{ steps.publish.output.repoContentsUrl }}
+        catalogInfoPath: '/catalog-info.yaml'
+
+  output:
+    links:
+      - title: Repository
+        url: ${{ steps.publish.output.remoteUrl }}
+      - title: Open in catalog
+        icon: catalog
+        entityRef: ${{ steps.register.output.entityRef }}
+
+---
+# skeleton/catalog-info.yaml
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: ${{ values.name }}
+  description: ${{ values.description }}
+  annotations:
+    github.com/project-slug: ${{ values.repoUrl | parseRepoUrl | pick('owner') }}/${{ values.repoUrl | parseRepoUrl | pick('repo') }}
+    azure.com/resource-group: rg-${{ values.name }}
+spec:
+  type: infrastructure
+  lifecycle: production
+  owner: ${{ values.owner }}
+  system: azure-infrastructure
+
+---
+# skeleton/.github/workflows/deploy-vm.yml
+name: Deploy Azure VM
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AZURE_RESOURCE_GROUP: rg-${{ values.name }}
+  AZURE_LOCATION: ${{ values.location }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: {% raw %}${{ secrets.AZURE_CREDENTIALS }}{% endraw %}
+    
+    - name: Create Resource Group
+      run: |
+        az group create \
+          --name {% raw %}${{ env.AZURE_RESOURCE_GROUP }}{% endraw %} \
+          --location {% raw %}${{ env.AZURE_LOCATION }}{% endraw %}
+    
+    - name: Deploy Bicep Template
+      uses: azure/arm-deploy@v1
+      with:
+        subscriptionId: {% raw %}${{ secrets.AZURE_SUBSCRIPTION_ID }}{% endraw %}
+        resourceGroupName: {% raw %}${{ env.AZURE_RESOURCE_GROUP }}{% endraw %}
+        template: ./infrastructure/main.bicep
+        parameters: ./infrastructure/parameters.json
+        deploymentName: vm-deployment-{% raw %}${{ github.run_number }}{% endraw %}
+    
+    - name: Get VM Information
+      run: |
+        VM_NAME="${{ values.name }}-vm"
+        RESOURCE_GROUP="${{ env.AZURE_RESOURCE_GROUP }}"
+        
+        echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **VM Name**: $VM_NAME" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resource Group**: $RESOURCE_GROUP" >> $GITHUB_STEP_SUMMARY
+        echo "- **Location**: ${{ values.location }}" >> $GITHUB_STEP_SUMMARY
+        
+        # Get public IP if exists
+        PUBLIC_IP=$(az vm list-ip-addresses \
+          --resource-group $RESOURCE_GROUP \
+          --name $VM_NAME \
+          --query "[0].virtualMachine.network.publicIpAddresses[0].ipAddress" \
+          --output tsv 2>/dev/null || echo "None")
+        
+        if [ "$PUBLIC_IP" != "None" ] && [ "$PUBLIC_IP" != "" ]; then
+          echo "- **Public IP**: $PUBLIC_IP" >> $GITHUB_STEP_SUMMARY
+        fi
+
+---
+# skeleton/infrastructure/main.bicep
+@description('Name of the virtual machine')
+param vmName string = '${{ values.name }}-vm'
+
+@description('Location for all resources')
+param location string = '${{ values.location }}'
+
+@description('Size of the virtual machine')
+param vmSize string = '${{ values.vmSize }}'
+
+@description('Operating system type')
+@allowed(['ubuntu', 'windows'])
+param osType string = '${{ values.osType }}'
+
+@description('Admin username for the VM')
+param adminUsername string = 'azureuser'
+
+@description('SSH public key or password')
+@secure()
+param adminPasswordOrKey string
+
+@description('Allow SSH/RDP access')
+param allowSshRdp bool = ${{ values.allowSshRdp }}
+
+@description('Allowed IP ranges for SSH/RDP')
+param allowedIpRanges array = []
+
+// Variables
+var networkSecurityGroupName = '${vmName}-nsg'
+var virtualNetworkName = '${vmName}-vnet'
+var subnetName = 'default'
+var publicIPAddressName = '${vmName}-pip'
+var networkInterfaceName = '${vmName}-nic'
+var osDiskType = 'Premium_LRS'
+
+// OS Configuration
+var osConfig = osType == 'ubuntu' ? {
+  publisher: 'Canonical'
+  offer: '0001-com-ubuntu-server-focal'
+  sku: '20_04-lts-gen2'
+  version: 'latest'
+  adminUsername: adminUsername
+  disablePasswordAuthentication: true
+  ssh: {
+    publicKeys: [
+      {
+        path: '/home/${adminUsername}/.ssh/authorized_keys'
+        keyData: adminPasswordOrKey
+      }
+    ]
+  }
+} : {
+  publisher: 'MicrosoftWindowsServer'
+  offer: 'WindowsServer'
+  sku: '2022-datacenter-g2'
+  version: 'latest'
+  adminUsername: adminUsername
+  adminPassword: adminPasswordOrKey
+}
+
+// Security rules
+var securityRules = allowSshRdp ? [
+  {
+    name: osType == 'ubuntu' ? 'SSH' : 'RDP'
+    properties: {
+      priority: 1001
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Inbound'
+      sourceAddressPrefix: length(allowedIpRanges) > 0 ? allowedIpRanges[0] : 'Internet'
+      sourcePortRange: '*'
+      destinationAddressPrefix: '*'
+      destinationPortRange: osType == 'ubuntu' ? '22' : '3389'
+    }
+  }
+] : []
+
+// Network Security Group
+resource networkSecurityGroup 'Microsoft.Network/networkSecurityGroups@2023-04-01' = {
+  name: networkSecurityGroupName
+  location: location
+  properties: {
+    securityRules: securityRules
+  }
+}
+
+// Virtual Network
+resource virtualNetwork 'Microsoft.Network/virtualNetworks@2023-04-01' = {
+  name: virtualNetworkName
+  location: location
+  properties: {
+    addressSpace: {
+      addressPrefixes: [
+        '10.0.0.0/16'
+      ]
+    }
+    subnets: [
+      {
+        name: subnetName
+        properties: {
+          addressPrefix: '10.0.0.0/24'
+          networkSecurityGroup: {
+            id: networkSecurityGroup.id
+          }
+        }
+      }
+    ]
+  }
+}
+
+// Public IP (only if SSH/RDP is allowed)
+resource publicIPAddress 'Microsoft.Network/publicIPAddresses@2023-04-01' = if (allowSshRdp) {
+  name: publicIPAddressName
+  location: location
+  sku: {
+    name: 'Basic'
+  }
+  properties: {
+    publicIPAllocationMethod: 'Dynamic'
+    dnsSettings: {
+      domainNameLabel: vmName
+    }
+  }
+}
+
+// Network Interface
+resource networkInterface 'Microsoft.Network/networkInterfaces@2023-04-01' = {
+  name: networkInterfaceName
+  location: location
+  properties: {
+    ipConfigurations: [
+      {
+        name: 'ipconfig1'
+        properties: {
+          subnet: {
+            id: virtualNetwork.properties.subnets[0].id
+          }
+          privateIPAllocationMethod: 'Dynamic'
+          publicIPAddress: allowSshRdp ? {
+            id: publicIPAddress.id
+          } : null
+        }
+      }
+    ]
+  }
+}
+
+// Virtual Machine
+resource virtualMachine 'Microsoft.Compute/virtualMachines@2023-03-01' = {
+  name: vmName
+  location: location
+  properties: {
+    hardwareProfile: {
+      vmSize: vmSize
+    }
+    storageProfile: {
+      osDisk: {
+        createOption: 'FromImage'
+        managedDisk: {
+          storageAccountType: osDiskType
+        }
+      }
+      imageReference: {
+        publisher: osConfig.publisher
+        offer: osConfig.offer
+        sku: osConfig.sku
+        version: osConfig.version
+      }
+    }
+    networkProfile: {
+      networkInterfaces: [
+        {
+          id: networkInterface.id
+        }
+      ]
+    }
+    osProfile: osType == 'ubuntu' ? {
+      computerName: vmName
+      adminUsername: osConfig.adminUsername
+      disablePasswordAuthentication: osConfig.disablePasswordAuthentication
+      linuxConfiguration: {
+        ssh: osConfig.ssh
+      }
+    } : {
+      computerName: vmName
+      adminUsername: osConfig.adminUsername
+      adminPassword: osConfig.adminPassword
+    }
+  }
+}
+
+// Outputs
+output vmName string = virtualMachine.name
+output vmId string = virtualMachine.id
+output publicIPAddress string = allowSshRdp ? publicIPAddress.properties.ipAddress : 'None'
+output privateIPAddress string = networkInterface.properties.ipConfigurations[0].properties.privateIPAddress
+
+---
+# skeleton/infrastructure/parameters.json
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "adminPasswordOrKey": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/{subscription-id}/resourceGroups/{rg-name}/providers/Microsoft.KeyVault/vaults/{vault-name}"
+        },
+        "secretName": "vm-admin-key"
+      }
+    }
+  }
+}
+
+---
+# skeleton/README.md
+# ${{ values.name }} - Azure Virtual Machine
+
+${{ values.description }}
+
+## Overview
+
+This repository contains the infrastructure as code for deploying a ${{ values.osType }} virtual machine on Azure.
+
+## Architecture
+
+- **VM Size**: ${{ values.vmSize }}
+- **Operating System**: ${{ values.osType }}
+- **Location**: ${{ values.location }}
+- **SSH/RDP Access**: ${{ values.allowSshRdp }}
+
+## Deployment
+
+The VM is automatically deployed using GitHub Actions when changes are pushed to the main branch.
+
+### Prerequisites
+
+1. Azure Service Principal with appropriate permissions
+2. GitHub repository secrets configured:
+   - `AZURE_CREDENTIALS`: Azure service principal credentials
+   - `AZURE_SUBSCRIPTION_ID`: Your Azure subscription ID
+
+### Manual Deployment
+
+```bash
+# Login to Azure
+az login
+
+# Create resource group
+az group create --name rg-${{ values.name }} --location ${{ values.location }}
+
+# Deploy the template
+az deployment group create \
+  --resource-group rg-${{ values.name }} \
+  --template-file infrastructure/main.bicep \
+  --parameters infrastructure/parameters.json
+```
+
+## Access
+
+{% if values.allowSshRdp %}
+{% if values.osType == 'ubuntu' %}
+SSH access is enabled. Use the following command to connect:
+
+```bash
+ssh azureuser@<public-ip-address>
+```
+{% else %}
+RDP access is enabled. Use Remote Desktop Connection to connect to the public IP address.
+{% endif %}
+{% else %}
+External access is disabled for security. Use Azure Bastion or VPN for secure access.
+{% endif %}
+
+## Security
+
+- Network Security Group with minimal required rules
+- No public IP unless explicitly requested
+- Managed identities used where possible
+- Boot diagnostics enabled for troubleshooting
+
+## Monitoring
+
+Consider enabling:
+- Azure Monitor for VMs
+- Log Analytics workspace
+- Security Center recommendations
+
+## Cleanup
+
+To remove all resources:
+
+```bash
+az group delete --name rg-${{ values.name }} --yes --no-wait
+```
+
+## Support
+
+For issues or questions, contact the platform team.
